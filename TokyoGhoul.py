@@ -30,7 +30,8 @@ c.execute('''CREATE TABLE IF NOT EXISTS transactions (
                 amount INTEGER,
                 currency TEXT,
                 reason TEXT,
-                timestamp TEXT
+                timestamp TEXT,
+                status TEXT DEFAULT NULL
             )''')
 conn.commit()
 
@@ -98,7 +99,7 @@ async def usercommands(ctx):
     help_text = """
     **User Commands:**
 
-    **!deposit <currency> <amount> <reason>**  
+    **!deposit <currency1>,<currency2>... <amount1>,<amount2>... <reason>**  
     Deposits a specified amount into the user's account. Logs the reason for the deposit.
 
     **!spend <currency> <amount> <reason>**  
@@ -107,7 +108,7 @@ async def usercommands(ctx):
     **!balance [currency]**  
     Checks the balance of a specific currency or all currencies.
 
-    **!userbalance [currency]**  
+    **!userbalance [currency] <@user>**  
     Checks the balance of a specific currency or all currencies.
 
     **!history <@user> [limit]**  
@@ -142,32 +143,82 @@ async def admincommands(ctx):
     **!history_admin <@user> [limit]**  
     Views the transaction history of a specific user. Default limit is 5 transactions. 
     
-    **!remove <currency> <amount> <member1> <member2>**
+    **!remove <currency> <amount> <member1> <member2>...**
     Allows an admin to remove a specified amount of currency from one or more users.
+
+    **view_pending**
+    Checks pending deposits.
+
+    **approve_deposit <transaction_id1>,<transaction_id2>... <bool>**
+    Allows an admin to approve multiple or one transactions.
     """
     await send_embed(ctx, "Bot Commands", help_text)
 
-# Deposit command
+
+
 @bot.command()
-async def deposit(ctx, currency: str, amount: int, *, reason: str = "No reason provided"):
-    currency = currency.upper()
-    if currency not in CURRENCY_TYPES:
-        await send_embed(ctx, "Error", f"❌ Invalid currency type! Use one of: {', '.join(CURRENCY_TYPES)}")
+async def history(ctx, limit: int = 5):
+    user_id = ctx.author.id
+    c.execute("SELECT type, amount, currency, reason, timestamp FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit))
+    transactions = c.fetchall()
+
+    if not transactions:
+        await send_embed(ctx, "Transaction History", "📜 You have no transaction history.")
         return
 
+    history_text = "\n".join([f"📅 {t[4]} - **{t[0].capitalize()} {t[1]} {t[2]}** | *{t[3]}*" for t in transactions])
+    await send_embed(ctx, "Your Transactions", history_text)
+
+@bot.command()
+async def deposit(ctx, currencies: str, amounts: str, *, reason: str = "No reason provided"):
+    # Split the input strings into lists
+    currency_list = currencies.upper().split(",")
+    amount_list = amounts.split(",")
+
+    # Validate the number of currencies and amounts match
+    if len(currency_list) != len(amount_list):
+        await send_embed(ctx, "Error", "❌ The number of currencies and amounts don't match. Please try again.")
+        return
+
+    # Validate each currency
+    for currency in currency_list:
+        if currency not in CURRENCY_TYPES:
+            await send_embed(ctx, "Error", f"❌ Invalid currency type! Use one of: {', '.join(CURRENCY_TYPES)}")
+            return
+
     user_id = ctx.author.id
-    balance = get_balance(user_id, currency)
-    new_balance = balance + amount
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    c.execute(f"UPDATE users SET {currency}=? WHERE user_id=?", (new_balance, user_id))
-    conn.commit()
+    # List to store formatted currency/amount pairs
+    formatted_deposits = []
 
-    log_transaction(user_id, "deposit", amount, currency, reason)
-    currency_symbol = "¥" if currency == "YEN" else ""
-    formatted_amount = f"{currency_symbol}{amount:,}" if currency == "YEN" else f"{amount:,} {currency}"
-    formatted_balance = f"{currency_symbol}{new_balance:,}" if currency == "YEN" else f"{new_balance:,} {currency}"
+    # Iterate through the currencies and amounts to log the deposit
+    for currency, amount_str in zip(currency_list, amount_list):
+        try:
+            amount = int(amount_str)  # Convert the amount to an integer
+        except ValueError:
+            await send_embed(ctx, "Error", f"❌ Invalid amount: {amount_str}. Please provide valid numeric values.")
+            return
 
-    await send_embed(ctx, "Deposit Successful", f"💰 {ctx.author.mention} deposited {formatted_amount}.\n**Reason:** {reason}\n**New balance:** {formatted_balance}")
+        # Log the deposit as pending
+        c.execute("INSERT INTO transactions (user_id, type, amount, currency, reason, timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                  (user_id, "deposit", amount, currency, reason, timestamp, "PENDING"))
+        conn.commit()
+
+        # Format the deposit (add yen symbol and commas if it's yen)
+        if currency == "YEN":
+            formatted_deposit = f"YEN: ¥{amount:,}"  # Format yen with commas and prepend yen symbol
+        else:
+            formatted_deposit = f"{currency}: {amount:,}"  # Format other currencies with commas
+
+        # Append formatted deposit to the list
+        formatted_deposits.append(formatted_deposit)
+
+    # Send the confirmation embed with formatted deposits
+    await send_embed(ctx, "Deposit Pending", f"💰 {ctx.author.mention}, your deposits of the following currencies are pending approval:\n"
+                                             + "\n".join(formatted_deposits) +
+                                             f"\n**Reason:** {reason}\nPlease wait for approval from an admin.")
+
 
 
 # Spend command
@@ -284,6 +335,106 @@ async def give(ctx, member: discord.Member, currency: str, amount: int):
     formatted_balance = f"{currency_symbol}{new_balance:,}" if currency == "YEN" else f"{new_balance:,} {currency}"
     await send_embed(ctx, "Transaction Successful", f"✅ {ctx.author.mention} gave {formatted_amount} {currency} to {member.mention}.\n**New balance:** {formatted_balance}")
 
+
+# Admin command to approve or deny deposits
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def approve_deposit(ctx, transaction_ids: str, approve: bool):
+    # Split transaction IDs and convert to integers
+    transaction_id_list = transaction_ids.split(",")
+    
+    # Track results
+    approved_transactions = []
+    denied_transactions = []
+    errors = []
+
+    for transaction_id in transaction_id_list:
+        try:
+            transaction_id = int(transaction_id.strip())  # Convert to integer
+            # Fetch the transaction details
+            c.execute("SELECT user_id, amount, currency FROM transactions WHERE id=? AND status='PENDING'", (transaction_id,))
+            transaction = c.fetchone()
+
+            if not transaction:
+                errors.append(f"❌ No pending transaction found with ID {transaction_id}.")
+                continue
+
+            user_id, amount, currency = transaction
+            status = "APPROVED" if approve else "DENIED"
+
+            # Update transaction status
+            c.execute("UPDATE transactions SET status=? WHERE id=?", (status, transaction_id))
+            conn.commit()
+            
+            user = ctx.guild.get_member(user_id)  # Get the user object by user_id
+
+            # Format amount correctly (add yen symbol and commas if necessary)
+            if currency == "YEN":
+                formatted_amount = f"¥{amount:,}"
+            else:
+                formatted_amount = f"{amount:,} {currency}"
+
+            if approve:
+                # If approved, update user balance
+                new_balance = get_balance(user_id, currency) + amount
+                c.execute(f"UPDATE users SET {currency}=? WHERE user_id=?", (new_balance, user_id))
+                conn.commit()
+
+                # Format new balance correctly
+                if currency == "YEN":
+                    formatted_balance = f"¥{new_balance:,}"
+                else:
+                    formatted_balance = f"{new_balance:,} {currency}"
+
+                approved_transactions.append(f"✅ **{formatted_amount}** approved by {ctx.author.mention} from {user.mention}(New balance: **{formatted_balance}**)")
+
+            else:
+                denied_transactions.append(f"❌ **{formatted_amount}** denied by {ctx.author.mention} from {user.mention}")
+
+        except ValueError:
+            errors.append(f"❌ Invalid transaction ID: {transaction_id}. Please use numeric values.")
+
+    # Build the response message
+    response = []
+    if approved_transactions:
+        response.append("### ✅ Approved Transactions:\n" + "\n".join(approved_transactions))
+    if denied_transactions:
+        response.append("### ❌ Denied Transactions:\n" + "\n".join(denied_transactions))
+    if errors:
+        response.append("### ⚠️ Errors:\n" + "\n".join(errors))
+
+    await send_embed(ctx, "Deposit Approval Results", "\n\n".join(response) if response else "No transactions processed.")
+
+
+# Admin command to view all pending transactions
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def view_pending(ctx):
+    c.execute("SELECT id, user_id, amount, currency, reason, timestamp FROM transactions WHERE status='PENDING'")
+    pending_transactions = c.fetchall()
+
+    if not pending_transactions:
+        await send_embed(ctx, "No Pending Deposits", "📜 No deposits are pending approval.")
+        return
+
+    pending_text = ""
+    for transaction in pending_transactions:
+        user_id = transaction[1]
+        user = ctx.guild.get_member(user_id)  # Get the user object by user_id
+
+        if user:
+            username = user.name  # Get the username
+            mention = user.mention  # Use mention for clickable link
+        else:
+            username = f"Unknown user ({user_id})"
+            mention = "Unknown user"
+
+        pending_text += f"ID: {transaction[0]} | {mention} | {transaction[2]} {transaction[3]} | Reason: {transaction[4]} | Time: {transaction[5]}\n"
+
+    await send_embed(ctx, "Pending Deposits", pending_text)
+
+
+
 #Admin Command: Give all users. 
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -384,7 +535,36 @@ async def remove(ctx, currency: str, amount: int, *members: discord.Member):
         formatted_balance = f"{currency_symbol}{new_balance:,}" if currency == "YEN" else f"{new_balance:,} {currency}"
         await send_embed(ctx, "Admin Action", 
                          f"{formatted_amount} {currency} removed from {member.mention}.\n"
-                         f"New balance: {formatted_balance} {currency}.")
+                         f"New balance: {formatted_balance}.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def approve(ctx, user_id: int, *, reason: str):
+    c.execute("SELECT currency, amount FROM transactions WHERE user_id=? AND reason=? AND type='deposit' AND status IS NULL", (user_id, reason))
+    rows = c.fetchall()
+    if not rows:
+        await send_embed(ctx, "Error", "❌ No matching deposit requests found.")
+        return
+    
+    for currency, amount in rows:
+        c.execute(f"UPDATE users SET {currency} = {currency} + ? WHERE user_id = ?", (amount, user_id))
+    c.execute("UPDATE transactions SET status='approved' WHERE user_id=? AND reason=? AND type='deposit'", (user_id, reason))
+    conn.commit()
+    
+    user = await bot.fetch_user(user_id)
+    await send_embed(ctx, "Approval", f"✅ Approved deposits for <@{user_id}>.")
+    await user.send(f"✅ Your deposits have been approved!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def reject(ctx, user_id: int, *, reason: str = "No reason provided"):
+    c.execute("UPDATE transactions SET status='rejected' WHERE user_id=? AND reason=? AND type='deposit' AND status IS NULL", (user_id, reason))
+    conn.commit()
+    
+    user = await bot.fetch_user(user_id)
+    await send_embed(ctx, "Rejection", f"❌ Rejected deposits for <@{user_id}>.")
+    await user.send(f"❌ Your deposit request was rejected. Reason: {reason}")
+
 
 
 # Run bot
